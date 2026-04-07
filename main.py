@@ -26,7 +26,7 @@ collection = chroma_client.get_or_create_collection(
     metadata={"hnsw:space": "cosine"},
 )
 
-OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://localhost:11434")
+OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://127.0.0.1:11434")
 EMBED_MODEL  = os.getenv("EMBED_MODEL",  "nomic-embed-text")
 LLM_MODEL  = os.getenv("LLM_MODEL",  "exaone3.5")
 CHUNK_SIZE   = 500
@@ -364,7 +364,7 @@ async def rag_chat(req: RagChatRequest):
     }
 
 
-async def call_llm(messages: list, timeout: int = 60) -> str:
+async def call_llm(messages: list, timeout: int = 180) -> str:
     """LLM(Ollama) 호출 공통 함수."""
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -377,7 +377,7 @@ async def call_llm(messages: list, timeout: int = 60) -> str:
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail="Ollama 서버에 연결할 수 없습니다.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM 호출 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"LLM 호출 실패: {type(e).__name__}: {e}")
 
 
 @app.post("/generate-pool")
@@ -441,7 +441,7 @@ async def generate_pool(req: GeneratePoolRequest):
             raw = await call_llm([
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": prompt},
-            ], timeout=60)
+            ], timeout=180)
             text = raw.strip().strip('"').strip()
             if text and not is_corrupted(text):
                 return {"category": category, "text": text}
