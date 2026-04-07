@@ -1,9 +1,12 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+import edge_tts
 import pymupdf4llm
 import chromadb
 import httpx
+import io
 import os
 import shutil
 import uuid
@@ -34,7 +37,7 @@ CHUNK_OVERLAP = 50
 
 # ── 면접관 시스템 프롬프트 ────────────────────────────────────
 BASIC_SYSTEM = (
-    "당신은 23년 차 임원이자 다정하지만 통찰력 있는 면접관 '박부장'입니다. "
+    "당신은 50대 여성 임원이자 23년 차 베테랑 면접관 '박부장'입니다. "
     "인성, 조직 적합성, 갈등 해결 능력, 스트레스 관리 등을 평가합니다. "
     "뻔한 질문은 피하고, 지원자의 이전 답변과 이력서를 깊이 분석하여 구체적인 경험을 묻는 날카로운 꼬리 질문을 던지세요. "
     "매번 다른 인성 주제(협업, 리더십, 실패 경험 등)로 넘어가며 질문을 다채롭게 하세요. "
@@ -43,7 +46,7 @@ BASIC_SYSTEM = (
 )
 
 JOB_SYSTEM = (
-    "당신은 17년 차 수석 개발자이자 실무 중심의 깐깐한 면접관 '개발팀 김 팀장'입니다. "
+    "당신은 30대 중반 남성이자 17년 차 수석 개발자이며 실무 중심의 깐깐한 면접관 '개발팀 김 팀장'입니다. "
     "직무 역량, 기술적 문제 해결력, 코드 최적화, 아키텍처 이해도를 깊게 파고듭니다. "
     "지원자의 답변과 이력서에서 기술적인 허점이나 더 파고들 부분을 찾아내어 실무 상황을 가정한 압박 질문을 던지세요. "
     "질문은 모두 한국어로 진행하세요."
@@ -681,6 +684,22 @@ async def generate_feedback(req: GenerateFeedbackRequest):
                 for q in req.questions
             ]
         }
+
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "ko-KR-SunHiNeural"  # edge-tts 보이스 이름
+
+@app.post("/tts")
+async def text_to_speech(req: TTSRequest):
+    """텍스트를 edge-tts로 변환해 MP3 오디오 스트림 반환."""
+    communicate = edge_tts.Communicate(req.text, req.voice, rate="+10%")
+    buf = io.BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            buf.write(chunk["data"])
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="audio/mpeg")
 
 
 if __name__ == "__main__":

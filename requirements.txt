@@ -5,3 +5,4 @@ pymupdf4llm==1.27.2.1
 python-multipart
 httpx==0.28.1
 chromadb
+edge-tts
