@@ -493,32 +493,56 @@ async def evaluate_answer(req: EvaluateAnswerRequest):
     return {"quality": quality}
 
 
+# 소프트스킬 채점 루브릭 — 역량별 점수 구간 기준
+SKILL_RUBRICS = {
+    "job": {
+        "기술깊이":    "90+: 개념·원리 명확, 실사용 경험을 구체적 수치·사례로 뒷받침, 한계/트레이드오프 인지 | 70~89: 개념 정확하나 실사용 경험 추상적 | 50~69: 부분 이해, 오개념 혼재 | ~49: 핵심 벗어남·암기 수준·한 단어·무응답",
+        "문제해결력":  "90+: 문제 정의→원인 분석→해결 과정→결과를 단계별로 명확히 서술 | 70~89: 해결 과정 있으나 근거·결과 불명확 | 50~69: 해결책만 언급, 과정 생략 | ~49: 문제 인식 부족·무응답",
+        "커뮤니케이션":"90+: 두괄식·STAR 구조, 핵심만 간결히 전달, 면접관 이해 고려 | 70~89: 내용 있으나 구조 산만·장황 | 50~69: 표현 모호, 의도 전달 부족 | ~49: 질문과 무관·한 단어 수준",
+        "논리적사고":  "90+: 주장에 근거 명확, 반례·예외 인지, 일관된 논리 | 70~89: 논리 흐름 있으나 근거 약하거나 비약 존재 | 50~69: 결론만 있고 논리 과정 생략 | ~49: 논리 구조 없음·무응답",
+        "성장가능성":  "90+: 구체적 학습 계획·실행 경험 제시, 자기인식 명확 | 70~89: 성장 의지는 있으나 구체성 부족 | 50~69: 일반적 언급에 그침 | ~49: 성장 의지 없음·무응답",
+    },
+    "basic": {
+        "커뮤니케이션":"90+: 두괄식·STAR 구조, 핵심만 간결히 전달, 상대 배려 표현 | 70~89: 내용 있으나 구조 산만·장황 | 50~69: 표현 모호, 의도 전달 부족 | ~49: 질문과 무관·한 단어 수준",
+        "조직적합성":  "90+: 팀·조직 가치관 부합 사례를 구체적으로 제시 | 70~89: 부합 의지 표현되나 사례 부족 | 50~69: 일반적 언급에 그침 | ~49: 관련 내용 없음·무응답",
+        "문제해결력":  "90+: 문제 정의→원인 분석→해결 과정→결과 명확 | 70~89: 해결 과정 있으나 결과 불명확 | 50~69: 해결책만 언급, 과정 생략 | ~49: 문제 인식 부족·무응답",
+        "리더십":      "90+: 구체적 리더십 발휘 경험, 팀원 동기부여·갈등 해결 사례 | 70~89: 리더십 경험 있으나 영향력 불명확 | 50~69: 역할만 언급, 리더십 내용 부족 | ~49: 관련 경험 없음·무응답",
+        "성장가능성":  "90+: 구체적 학습 계획·실행 경험, 자기인식 명확 | 70~89: 성장 의지는 있으나 구체성 부족 | 50~69: 일반적 언급에 그침 | ~49: 성장 의지 없음·무응답",
+    },
+}
+
+
 @app.post("/generate-feedback")
 async def generate_feedback(req: GenerateFeedbackRequest):
     """
     면접 종합 피드백 생성.
     - 면접 총평 (summary)
-    - 소프트스킬 카테고리별 점수 (softskill_analysis)
+    - 소프트스킬 카테고리별 루브릭 기반 채점 (score + evidence + weakness)
     - 질문별: 질문 의도, 답변 피드백, 개선된 답변
     """
     import json
 
     interviewer = "개발팀 김 팀장 (17년 차 수석 개발자)" if req.interview_type == "job" else "박부장 (23년 차 임원)"
-    skill_categories = '["기술깊이", "문제해결력", "커뮤니케이션", "논리적사고", "성장가능성"]' if req.interview_type == "job" \
-        else '["커뮤니케이션", "조직적합성", "문제해결력", "리더십", "성장가능성"]'
+    skill_keys = list(SKILL_RUBRICS.get(req.interview_type, SKILL_RUBRICS["job"]).keys())
+    rubrics = SKILL_RUBRICS.get(req.interview_type, SKILL_RUBRICS["job"])
 
     questions_text = "\n\n".join(
         f"[질문 {q.question_id}]\n질문: {q.question_text}\n답변: {q.answer_text}"
         for q in req.questions
     )
 
-    skill_keys = json.loads(skill_categories)
-    skill_schema = ", ".join(f'"{c}": 점수(0~100)' for c in skill_keys)
+    rubric_guide = "\n".join(f"  · {skill}: {desc}" for skill, desc in rubrics.items())
+
+    skill_schema_entries = "\n".join(
+        f'    "{c}": {{"score": 정수(0~100), "evidence": "이 점수를 매긴 근거 (답변 내용 직접 인용)", "weakness": "이 역량에서 부족한 점 (없으면 빈 문자열)"}}'
+        for c in skill_keys
+    )
+
     question_schema_lines = []
     for q in req.questions:
         question_schema_lines.append(
             '    {"question_id": ' + str(q.question_id) +
-            ', "intent": "이 질문의 의도", "feedback": "이 답변에 대한 구체적 피드백", "improved_answer": "더 나은 모범 답변"}'
+            ', "intent": "이 질문의 의도", "feedback": "이 답변에 대한 구체적 피드백", "improved_answer": "90점 이상의 모범 답변을 1인칭으로 직접 작성 (메타 설명 금지, 실제 답변 문장으로 작성)"}'
         )
     question_schema = ",\n".join(question_schema_lines)
 
@@ -530,11 +554,25 @@ async def generate_feedback(req: GenerateFeedbackRequest):
         "- 반드시 지원자가 실제로 작성한 답변 내용만을 기준으로 평가하세요.\n"
         "- 답변이 짧거나, 의미 없거나(예: 'sss', '모름', 한 단어), 질문과 무관하다면 그렇다고 솔직하게 평가하세요.\n"
         "- 실제 답변에 없는 내용을 '잘 설명했다'거나 '명확하게 전달했다'는 식으로 긍정 평가하지 마세요.\n"
-        "- feedback은 실제 답변의 구체적인 내용을 인용하거나 언급하며 작성하세요.\n\n"
+        "- feedback과 evidence는 실제 답변의 구체적인 내용을 인용하거나 언급하며 작성하세요.\n\n"
+        "【improved_answer 작성 원칙】\n"
+        "- improved_answer는 해당 질문에 대한 '90점 이상의 모범 답변'을 직접 작성하세요.\n"
+        "- 실제 면접에서 말하듯 자연스럽고 구체적인 1인칭 문장으로 작성하세요 (예: '저는 ~했습니다. ~를 통해 ~를 해결했습니다.').\n"
+        "- 지원자의 실제 답변에서 좋은 요소가 있다면 반영하되, 부족한 부분을 완성된 형태로 보완하세요.\n"
+        "- 메타 설명('~를 언급해야 합니다', '~에 대해 설명하십시오') 형태로 작성하지 마세요. 반드시 완성된 모범 답변 문장을 작성하세요.\n"
+        "- 분량은 3~5문장 내외로 핵심만 담아 작성하세요.\n\n"
+        "【소프트스킬 채점 루브릭】\n"
+        f"{rubric_guide}\n\n"
+        "위 루브릭을 기준으로 각 역량을 채점하세요. score는 루브릭 구간에 맞게 정수로, "
+        "evidence는 이 점수를 준 근거를 1~2문장으로 간결하게, weakness는 부족한 점을 1~2문장으로 간결하게 작성하세요. "
+        "evidence와 weakness 모두 '질문 N번에서' 또는 '질문 N과 M에서'처럼 특정 질문 번호를 언급하지 마세요. "
+        "전반적인 답변 경향을 기준으로 작성하세요.\n\n"
         "위 면접 전체를 분석하여 다음 JSON 형식으로만 응답하세요. JSON 외 다른 텍스트는 절대 포함하지 마세요:\n\n"
         "{\n"
         '  "summary": "면접 전체에 대한 2~3문장 총평 (실제 답변 품질을 솔직하게 반영)",\n'
-        f'  "softskill_analysis": {{{skill_schema}}},\n'
+        '  "softskill_analysis": {\n'
+        f"{skill_schema_entries}\n"
+        "  },\n"
         '  "questions": [\n'
         f"{question_schema}\n"
         "  ]\n}\n\n"
@@ -555,7 +593,10 @@ async def generate_feedback(req: GenerateFeedbackRequest):
         # 파싱 실패 시 기본 구조 반환
         return {
             "summary": "면접이 완료되었습니다.",
-            "softskill_analysis": {c: 70 for c in json.loads(skill_categories)},
+            "softskill_analysis": {
+                c: {"score": 70, "evidence": "", "weakness": ""}
+                for c in skill_keys
+            },
             "questions": [
                 {
                     "question_id": q.question_id,
