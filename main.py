@@ -111,21 +111,11 @@ class EmbedTextRequest(BaseModel):
     filename: str = "resume"
 
 
-class RagChatRequest(BaseModel):
-    user_id: str
-    interview_type: str          # "basic" | "job"
-    last_question: str
-    user_answer: str
-    interview_id: int | None = None
-
-
 class GeneratePoolRequest(BaseModel):
     user_id: str
     interview_type: str          # "basic" | "job"
 
 
-class GenerateGreetingRequest(BaseModel):
-    interview_type: str          # "basic" | "job"
 
 
 class ShouldFollowupRequest(BaseModel):
@@ -141,8 +131,6 @@ class GenerateFollowupRequest(BaseModel):
     user_answer: str
 
 
-class GenerateClosingRequest(BaseModel):
-    interview_type: str
 
 
 class EvaluateAnswerRequest(BaseModel):
@@ -310,63 +298,6 @@ async def retrieve_resume_context(user_id: str, query: str, top_k: int = 4) -> s
         return ""
 
 
-@app.post("/rag-chat")
-async def rag_chat(req: RagChatRequest):
-    """
-    RAG 기반 면접 질문 생성:
-    1. 유저 답변 기반 ChromaDB 이력서 청크 검색
-    2. 시스템 프롬프트 + 이력서 컨텍스트 조합
-    3. LLM(Ollama)으로 다음 질문 생성
-    """
-    system_prompt = JOB_SYSTEM if req.interview_type == "job" else BASIC_SYSTEM
-
-    # 1. 이력서 컨텍스트 검색 (답변 + 이전 질문으로 검색)
-    search_query = f"{req.last_question} {req.user_answer}"
-    resume_context = await retrieve_resume_context(req.user_id, search_query)
-
-    # 2. 이력서 정보가 있으면 시스템 프롬프트에 주입
-    if resume_context:
-        system_prompt += (
-            "\n\n[지원자 이력서 발췌]\n"
-            + resume_context
-            + "\n위 이력서 정보를 참고하여 지원자의 실제 경험에 맞는 구체적인 질문을 하세요."
-        )
-
-    # 3. LLM 호출
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": f"면접관의 이전 질문: {req.last_question}\n지원자 답변: {req.user_answer}",
-        },
-    ]
-
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                f"{OLLAMA_URL}/api/chat",
-                json={"model": LLM_MODEL, "messages": messages, "stream": False},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            next_question = data["message"]["content"]
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Ollama 서버에 연결할 수 없습니다. ollama serve 를 먼저 실행하세요.")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Solar 호출 실패: {e}")
-
-    # 4. 면접 종료 감지
-    is_finished = "[면접 종료]" in next_question
-    if is_finished:
-        next_question = next_question.replace("[면접 종료]", "").strip()
-
-    return {
-        "question": next_question,
-        "isFinished": is_finished,
-        "context_used": bool(resume_context),
-    }
-
-
 async def call_llm(messages: list, timeout: int = 180) -> str:
     """LLM(Ollama) 호출 공통 함수."""
     try:
@@ -479,33 +410,6 @@ async def generate_pool(req: GeneratePoolRequest):
     return {"questions": final}
 
 
-@app.post("/generate-greeting")
-async def generate_greeting(req: GenerateGreetingRequest):
-    """면접 시작 인사말 생성 (2~3문장)."""
-    if req.interview_type == "job":
-        prompt = (
-            "반드시 한국어로만 작성하고, 영어 번역이나 영어 설명을 절대 포함하지 마세요. "
-            "당신은 '개발팀 김 팀장'입니다. "
-            "오늘 기술 면접을 시작하는 짧고 격식 있는 인사말을 2~3문장으로 작성하세요. "
-            "면접관 소개와 오늘 면접의 방향(기술 역량 평가)을 간략히 언급하세요. "
-            "인사말만 출력하고 다른 내용은 포함하지 마세요."
-        )
-    else:
-        prompt = (
-            "반드시 한국어로만 작성하고, 영어 번역이나 영어 설명을 절대 포함하지 마세요. "
-            "당신은 '박부장'입니다. "
-            "오늘 임원 면접을 시작하는 따뜻하고 여유로운 인사말을 2~3문장으로 작성하세요. "
-            "면접관 소개와 편안한 분위기를 조성하는 말을 포함하세요. "
-            "인사말만 출력하고 다른 내용은 포함하지 마세요."
-        )
-
-    greeting = await call_llm([
-        {"role": "system", "content": "당신은 한국인 면접관입니다. 반드시 한국어로만 답변하세요. 다른 언어는 사용하지 않습니다."},
-        {"role": "user", "content": prompt},
-    ])
-    return {"greeting": greeting.strip()}
-
-
 @app.post("/should-followup")
 async def should_followup(req: ShouldFollowupRequest):
     """꼬리 질문 여부 판단. current_followup_count >= 2이면 즉시 false 반환."""
@@ -555,33 +459,6 @@ async def generate_followup(req: GenerateFollowupRequest):
         {"role": "user", "content": prompt},
     ])
     return {"followup_question": followup.strip()}
-
-
-@app.post("/generate-closing")
-async def generate_closing(req: GenerateClosingRequest):
-    """면접 마무리 멘트 생성 (2~3문장)."""
-    if req.interview_type == "job":
-        prompt = (
-            "반드시 한국어로만 작성하고, 영어 번역이나 영어 설명을 절대 포함하지 마세요. "
-            "당신은 '개발팀 김 팀장'입니다. "
-            "기술 면접이 끝났습니다. 짧고 격식 있는 마무리 멘트를 2~3문장으로 작성하세요. "
-            "수고했다는 말과 결과 안내 관련 내용을 포함하세요. "
-            "마무리 멘트만 출력하세요."
-        )
-    else:
-        prompt = (
-            "반드시 한국어로만 작성하고, 영어 번역이나 영어 설명을 절대 포함하지 마세요. "
-            "당신은 '박부장'입니다. "
-            "임원 면접이 끝났습니다. 따뜻하고 격려하는 마무리 멘트를 2~3문장으로 작성하세요. "
-            "수고했다는 말과 앞으로의 기대를 담아 주세요. "
-            "마무리 멘트만 출력하세요."
-        )
-
-    closing = await call_llm([
-        {"role": "system", "content": "You are a Korean interviewer. You MUST respond only in Korean (한국어). Never use English, Japanese, Chinese, or any other language. Use correct Korean spelling and spacing."},
-        {"role": "user", "content": prompt},
-    ])
-    return {"closing": closing.strip()}
 
 
 @app.post("/evaluate-answer")
@@ -647,11 +524,16 @@ async def generate_feedback(req: GenerateFeedbackRequest):
 
     prompt = (
         f"당신은 면접관 '{interviewer}'입니다.\n"
-        f"아래는 면접에서 오간 질문과 답변입니다.\n\n"
+        f"아래는 면접에서 오간 질문과 실제 지원자의 답변입니다.\n\n"
         f"{questions_text}\n\n"
+        "【중요 평가 원칙】\n"
+        "- 반드시 지원자가 실제로 작성한 답변 내용만을 기준으로 평가하세요.\n"
+        "- 답변이 짧거나, 의미 없거나(예: 'sss', '모름', 한 단어), 질문과 무관하다면 그렇다고 솔직하게 평가하세요.\n"
+        "- 실제 답변에 없는 내용을 '잘 설명했다'거나 '명확하게 전달했다'는 식으로 긍정 평가하지 마세요.\n"
+        "- feedback은 실제 답변의 구체적인 내용을 인용하거나 언급하며 작성하세요.\n\n"
         "위 면접 전체를 분석하여 다음 JSON 형식으로만 응답하세요. JSON 외 다른 텍스트는 절대 포함하지 마세요:\n\n"
         "{\n"
-        '  "summary": "면접 전체에 대한 2~3문장 총평",\n'
+        '  "summary": "면접 전체에 대한 2~3문장 총평 (실제 답변 품질을 솔직하게 반영)",\n'
         f'  "softskill_analysis": {{{skill_schema}}},\n'
         '  "questions": [\n'
         f"{question_schema}\n"
@@ -660,7 +542,7 @@ async def generate_feedback(req: GenerateFeedbackRequest):
     )
 
     raw = await call_llm([
-        {"role": "system", "content": "You are a Korean interview evaluator. Respond ONLY with valid JSON in Korean. No markdown, no explanation, just JSON."},
+        {"role": "system", "content": "You are a Korean interview evaluator. Respond ONLY with valid JSON in Korean. No markdown, no explanation, just JSON. Evaluate strictly based on the actual answer provided. Do NOT fabricate or assume positive qualities that are not present in the answer."},
         {"role": "user", "content": prompt},
     ], timeout=120)
 
@@ -686,6 +568,79 @@ async def generate_feedback(req: GenerateFeedbackRequest):
         }
 
 
+# 알파벳 → 한국어 발음 매핑
+_LETTER_KO = {
+    'a':'에이','b':'비','c':'씨','d':'디','e':'이','f':'에프','g':'지',
+    'h':'에이치','i':'아이','j':'제이','k':'케이','l':'엘','m':'엠',
+    'n':'엔','o':'오','p':'피','q':'큐','r':'알','s':'에스','t':'티',
+    'u':'유','v':'브이','w':'더블유','x':'엑스','y':'와이','z':'지',
+}
+
+# 기술 용어 사전 (소문자 키)
+_TECH_KO = {
+    "HTTP":"에이치티티피", "HTTPS":"에이치티티피에스",
+    "api":"에이피아이", "apis":"에이피아이",
+    "rest":"레스트", "graphql":"그래프큐엘",
+    "sql":"에스큐엘", "nosql":"노에스큐엘",
+    "html":"에이치티엠엘", "css":"씨에스에스",
+    "url":"유알엘", "urls":"유알엘",
+    "ui":"유아이", "ux":"유엑스",
+    "db":"디비", "os":"오에스",
+    "aws":"에이더블유에스", "gcp":"지씨피", "azure":"애저",
+    "jwt":"제이더블유티", "oauth":"오어스",
+    "ci":"씨아이", "cd":"씨디",
+    "oop":"오오피", "mvc":"엠브이씨", "mvp":"엠브이피",
+    "jvm":"제이브이엠", "jdk":"제이디케이", "jre":"제이알이",
+    "sdk":"에스디케이", "ide":"아이디이",
+    "cpu":"씨피유", "gpu":"지피유", "ram":"램",
+    "ssh":"에스에스에이치", "ssl":"에스에스엘", "tls":"티엘에스",
+    "ssd":"에스에스디", "hdd":"에이치디디",
+    "json":"제이슨", "xml":"엑스엠엘", "yaml":"야믈",
+    "grpc":"지알피씨", "tcp":"티씨피", "udp":"유디피", "ip":"아이피",
+    "git":"깃", "github":"깃허브", "gitlab":"깃랩",
+    "docker":"도커", "kubernetes":"쿠버네티스", "k8s":"케이에잇에스",
+    "linux":"리눅스", "ubuntu":"우분투",
+    "spring":"스프링", "react":"리액트", "vue":"뷰", "angular":"앵귤러",
+    "nodejs":"노드제이에스", "django":"장고", "flask":"플라스크",
+    "mysql":"마이에스큐엘", "postgresql":"포스트그레에스큐엘",
+    "redis":"레디스", "mongodb":"몽고디비",
+    "kafka":"카프카", "rabbitmq":"래빗엠큐",
+    "nginx":"엔진엑스", "apache":"아파치",
+    "msa":"엠에스에이", "devops":"데브옵스",
+    "backend":"백엔드", "frontend":"프론트엔드",
+    "server":"서버", "client":"클라이언트",
+    "framework":"프레임워크", "library":"라이브러리",
+    "cloud":"클라우드", "serverless":"서버리스",
+    "microservice":"마이크로서비스", "monolithic":"모놀리식",
+    "performance":"퍼포먼스", "scalability":"확장성",
+    "cache":"캐시", "caching":"캐싱",
+    "deploy":"배포", "deployment":"배포",
+    "whisper":"위스퍼", "edge-tts":"엣지 티티에스",
+    "mediapipe":"미디어파이프", "pymupdf":"파이엠유피디에프",
+    "get":"겟", "post":"포스트", "put":"풋", "delete":"딜리트",
+}
+
+def _word_to_ko(word: str) -> str:
+    """단어를 한국어 발음으로 변환. 사전 → 알파벳 한 글자씩 fallback."""
+    lower = word.lower()
+    if lower in _TECH_KO:
+        return _TECH_KO[lower]
+    # 알파벳을 한 글자씩 읽기 (예: "http" → "에이치 티 티 피")
+    return " ".join(_LETTER_KO.get(c, c) for c in lower if c.isalpha())
+
+def preprocess_tts_korean(text: str) -> str:
+    """한국어 TTS 전달 전 영어 단어를 한국어 발음으로 치환."""
+    import re
+    # URL 전체를 먼저 제거 (주소 자체를 읽으면 너무 길어짐)
+    text = re.sub(r'https?://\S+', '링크', text)
+    # 영문+숫자 혼합 단어 처리 (예: Node.js, k8s, CI/CD)
+    text = re.sub(r'\bNode\.js\b', '노드 제이에스', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bCI/CD\b', '씨아이 씨디', text, flags=re.IGNORECASE)
+    # 영문 단어 시퀀스 치환 (한국어 글자가 섞이지 않은 순수 영어 단어)
+    text = re.sub(r'[a-zA-Z][a-zA-Z0-9]*', lambda m: _word_to_ko(m.group()), text)
+    return text
+
+
 class TTSRequest(BaseModel):
     text: str
     voice: str = "ko-KR-SunHiNeural"  # edge-tts 보이스 이름
@@ -693,7 +648,8 @@ class TTSRequest(BaseModel):
 @app.post("/tts")
 async def text_to_speech(req: TTSRequest):
     """텍스트를 edge-tts로 변환해 MP3 오디오 스트림 반환."""
-    communicate = edge_tts.Communicate(req.text, req.voice, rate="+10%")
+    tts_text = preprocess_tts_korean(req.text) if req.voice.startswith("ko-KR") else req.text
+    communicate = edge_tts.Communicate(tts_text, req.voice, rate="+10%")
     buf = io.BytesIO()
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
