@@ -6,10 +6,16 @@ import edge_tts
 import pymupdf4llm
 import chromadb
 import httpx
+import asyncio
 import io
+import json
 import os
+import re
 import shutil
 import uuid
+import tempfile
+from pathlib import Path
+from faster_whisper import WhisperModel
 
 # ── 앱 초기화 ───────────────────────────────────────────────
 app = FastAPI()
@@ -28,6 +34,192 @@ collection = chroma_client.get_or_create_collection(
     name="resumes",
     metadata={"hnsw:space": "cosine"},
 )
+
+# ── Whisper STT 모델 초기화 ─────────────────────────────────
+_WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")
+whisper_model = WhisperModel(_WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+
+# ── 직군별 STT initial_prompt ───────────────────────────────
+# Whisper가 이 어휘 분포를 기반으로 기술 용어를 우선 인식
+
+_STT_PROMPTS_KO: dict[str, str] = {
+    "backend": (
+        "저는 백엔드 개발자로 자바, 스프링 부트, 파이썬, 장고를 사용합니다. "
+        "REST API, JPA, 하이버네이트, 마이크로서비스 아키텍처, MSA를 경험했습니다. "
+        "MySQL, PostgreSQL, Redis, MongoDB 등 데이터베이스를 다루며, "
+        "도커, 쿠버네티스, CI/CD, AWS 클라우드에 배포한 경험이 있습니다. "
+        "알고리즘, 자료구조, 객체지향 프로그래밍, 디자인 패턴, 트랜잭션, 인덱스를 공부했습니다."
+    ),
+    "frontend": (
+        "저는 프론트엔드 개발자로 리액트, 뷰, 앵귤러, 타입스크립트를 사용합니다. "
+        "HTML, CSS, 자바스크립트, 웹팩, 바이트, 상태 관리 라이브러리를 다룹니다. "
+        "리덕스, 리코일, 주스탠드 같은 상태 관리와 리액트 쿼리를 활용했습니다. "
+        "웹 접근성, 반응형 디자인, 크로스 브라우징, 성능 최적화, SEO를 고려한 개발을 합니다. "
+        "REST API 연동, GraphQL, 웹소켓, UI/UX 설계 경험이 있습니다."
+    ),
+    "fullstack": (
+        "저는 풀스택 개발자로 프론트엔드와 백엔드 모두 개발합니다. "
+        "리액트, 타입스크립트, 노드제이에스, 자바, 스프링 부트를 사용합니다. "
+        "REST API, 데이터베이스 설계, 클라우드 배포, CI/CD 파이프라인을 구축했습니다. "
+        "MySQL, MongoDB, Redis, 도커, 쿠버네티스, AWS를 경험했습니다."
+    ),
+    "data": (
+        "저는 데이터 엔지니어 또는 데이터 사이언티스트입니다. "
+        "파이썬, 판다스, 넘파이, 사이킷런, 텐서플로우, 파이토치를 사용합니다. "
+        "머신러닝, 딥러닝, 자연어 처리, 컴퓨터 비전, 강화학습을 공부했습니다. "
+        "SQL, 스파크, 하둡, 카프카, 에어플로우, 데이터 파이프라인을 다루며, "
+        "A/B 테스트, 피처 엔지니어링, 모델 튜닝, MLOps 경험이 있습니다."
+    ),
+    "devops": (
+        "저는 DevOps 엔지니어로 인프라와 배포 자동화를 담당합니다. "
+        "도커, 쿠버네티스, 헬름, 테라폼, 앤서블을 사용합니다. "
+        "AWS, GCP, Azure 클라우드 인프라를 설계하고 운영합니다. "
+        "CI/CD 파이프라인, 깃허브 액션, 젠킨스, 아르고CD를 구축했습니다. "
+        "프로메테우스, 그라파나, ELK 스택으로 모니터링과 로깅을 구성했습니다."
+    ),
+    "mobile": (
+        "저는 모바일 개발자로 안드로이드와 iOS 앱을 개발합니다. "
+        "코틀린, 자바, 스위프트, 플러터, 리액트 네이티브를 사용합니다. "
+        "젯팩 컴포즈, SwiftUI, 상태 관리, 비동기 처리를 경험했습니다. "
+        "REST API 연동, 로컬 데이터베이스, 푸시 알림, 앱 성능 최적화를 다룹니다. "
+        "구글 플레이스토어, 앱스토어 배포 경험이 있습니다."
+    ),
+    "security": (
+        "저는 보안 엔지니어로 취약점 분석과 침투 테스트를 수행합니다. "
+        "웹 취약점, OWASP Top 10, SQL 인젝션, XSS, CSRF를 분석합니다. "
+        "암호화, 해시, 공개키 기반 구조, TLS, 인증과 인가를 이해합니다. "
+        "버프 스위트, 메타스플로잇, 와이어샤크, 네트워크 패킷 분석을 활용합니다. "
+        "보안 정책, 컴플라이언스, 취약점 보고서 작성 경험이 있습니다."
+    ),
+    "game": (
+        "저는 게임 개발자로 유니티와 언리얼 엔진을 사용합니다. "
+        "C샵, C 플플, 게임 오브젝트, 컴포넌트 패턴, 렌더링 파이프라인을 공부했습니다. "
+        "물리 엔진, 충돌 처리, 애니메이션, 셰이더, 최적화 기법을 경험했습니다. "
+        "멀티플레이어 네트워크, 게임 서버, 매치메이킹 시스템을 다룹니다."
+    ),
+    "default": (
+        "저는 소프트웨어 개발자입니다. "
+        "알고리즘, 자료구조, 객체지향 프로그래밍, 디자인 패턴을 공부했습니다. "
+        "자바, 파이썬, 자바스크립트, 타입스크립트, C 플플 중 하나 이상을 사용합니다. "
+        "데이터베이스, REST API, 깃허브, 도커, 클라우드 환경을 경험했습니다. "
+        "트러블슈팅, 리팩토링, 코드 리뷰, 애자일 방법론에 익숙합니다."
+    ),
+}
+
+_STT_PROMPTS_EN: dict[str, str] = {
+    "backend": (
+        "I'm a backend developer using Java, Spring Boot, Python, Django, Node.js. "
+        "REST APIs, JPA, Hibernate, microservices, MySQL, PostgreSQL, Redis, MongoDB. "
+        "Docker, Kubernetes, CI/CD, AWS, algorithms, data structures, design patterns."
+    ),
+    "frontend": (
+        "I'm a frontend developer using React, Vue, Angular, TypeScript, JavaScript. "
+        "Webpack, Vite, Redux, Recoil, React Query, HTML, CSS, responsive design, SEO."
+    ),
+    "data": (
+        "I'm a data scientist using Python, Pandas, NumPy, scikit-learn, TensorFlow, PyTorch. "
+        "Machine learning, deep learning, NLP, computer vision, SQL, Spark, Kafka, MLOps."
+    ),
+    "devops": (
+        "I'm a DevOps engineer using Docker, Kubernetes, Helm, Terraform, Ansible. "
+        "AWS, GCP, Azure, CI/CD, GitHub Actions, Jenkins, ArgoCD, Prometheus, Grafana."
+    ),
+    "default": (
+        "I'm a software engineer. Algorithms, data structures, object-oriented programming, design patterns. "
+        "Java, Python, JavaScript, TypeScript, databases, REST APIs, Git, Docker, cloud deployment."
+    ),
+}
+
+# 직군 키워드 → 프롬프트 키 매핑
+_JOB_KEYWORD_MAP: list[tuple[list[str], str]] = [
+    (["프론트엔드", "frontend", "front-end", "프론트", "퍼블리셔", "ui", "ux"], "frontend"),
+    (["데이터", "data", "ml", "ai", "머신러닝", "딥러닝", "분석", "사이언티스트", "scientist", "엔지니어링"], "data"),
+    (["devops", "데브옵스", "인프라", "infra", "클라우드", "cloud", "sre", "운영"], "devops"),
+    (["모바일", "mobile", "android", "안드로이드", "ios", "flutter", "플러터"], "mobile"),
+    (["보안", "security", "침투", "취약점", "해킹"], "security"),
+    (["게임", "game", "unity", "유니티", "unreal", "언리얼"], "game"),
+    (["풀스택", "fullstack", "full-stack", "full stack"], "fullstack"),
+    (["백엔드", "backend", "back-end", "서버", "server"], "backend"),
+]
+
+def _resolve_job_keys(desired_job: str) -> list[str]:
+    """desired_job 문자열에서 매칭되는 모든 프롬프트 키를 반환."""
+    if not desired_job:
+        return ["default"]
+    lower = desired_job.lower()
+    matched = [key for keywords, key in _JOB_KEYWORD_MAP if any(kw in lower for kw in keywords)]
+    return matched if matched else ["default"]
+
+def _get_stt_prompt(desired_job: str, language: str) -> str:
+    keys = _resolve_job_keys(desired_job)
+    prompts = _STT_PROMPTS_EN if language == "en" else _STT_PROMPTS_KO
+    if len(keys) == 1:
+        return prompts.get(keys[0], prompts["default"])
+    # 여러 직군 매칭 시: 각 프롬프트의 첫 문장만 결합
+    # (Whisper initial_prompt는 어휘 프라이밍 목적 — 짧게 유지)
+    parts = []
+    for key in keys:
+        full = prompts.get(key, "")
+        first_sentence = full.split(". ")[0] + "." if full else ""
+        if first_sentence:
+            parts.append(first_sentence)
+    return " ".join(parts) if parts else prompts["default"]
+
+# STT 후처리 보정 사전 (발음 유사어 → 정규 표기)
+_STT_CORRECTIONS_KO = {
+    # 프레임워크 / 언어
+    "리엑트": "리액트",
+    "자바스클립트": "자바스크립트",
+    "자바 스크립트": "자바스크립트",
+    "타입스클립트": "타입스크립트",
+    "타입 스크립트": "타입스크립트",
+    "파이선": "파이썬",
+    "파이슨": "파이썬",
+    "코틀린": "코틀린",
+    "스프링부트": "스프링 부트",
+    # 인프라 / 도구
+    "쿠버네티즈": "쿠버네티스",
+    "쿠버네이티스": "쿠버네티스",
+    "쿠버네이티즈": "쿠버네티스",
+    "도클": "도커",
+    "깃헙": "깃허브",
+    "깃합": "깃허브",
+    "게더허브": "깃허브",
+    "포스트그래스": "포스트그레스",
+    "레디": "레디스",
+    "몽고": "몽고디비",
+    "카프": "카프카",
+    # CS 개념
+    "알로리즘": "알고리즘",
+    "알고리즘": "알고리즘",  # 정규화 (중복 방지)
+    "자료구": "자료구조",
+    "오브젝 지향": "객체지향",
+    "오브젝트지향": "객체지향",
+    "디자인패턴": "디자인 패턴",
+    "마이크로 서비스": "마이크로서비스",
+    "시아이씨디": "CI/CD",
+    "에이피아이": "API",
+    "레스트에이피아이": "REST API",
+    "오버라이딩": "오버라이딩",
+    "오버로딩": "오버로딩",
+    "싱글턴": "싱글톤",
+    "개비지컬렉션": "가비지 컬렉션",
+    "게비지컬렉션": "가비지 컬렉션",
+    "트랜젝션": "트랜잭션",
+    "트렌젝션": "트랜잭션",
+    "인덱싱": "인덱싱",
+    "쿼리": "쿼리",
+    "컨테이너": "컨테이너",
+    "로드밸런싱": "로드 밸런싱",
+    "캐슁": "캐싱",
+    "리팩토링": "리팩토링",
+}
+
+def correct_stt_text(text: str) -> str:
+    """STT 결과의 흔한 발음 오인식을 보정."""
+    for wrong, correct in _STT_CORRECTIONS_KO.items():
+        text = text.replace(wrong, correct)
+    return text
 
 OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://127.0.0.1:11434")
 EMBED_MODEL  = os.getenv("EMBED_MODEL",  "nomic-embed-text")
@@ -98,6 +290,43 @@ async def get_embedding(text: str) -> list[float]:
         return data["embeddings"][0]
 
 
+def _get_persona(interview_type: str) -> str:
+    """면접 유형에 따른 페르소나 문자열 반환."""
+    if interview_type == "job":
+        return "17년 차 수석 개발자 면접관 '개발팀 김 팀장'"
+    return "23년 차 임원 면접관 '박부장'"
+
+
+def _extract_json(raw: str) -> dict:
+    """LLM 응답에서 JSON 객체를 추출해 파싱. 실패 시 빈 dict 반환."""
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
+    if start == -1 or end == 0:
+        return {}
+    return json.loads(raw[start:end])
+
+
+async def _embed_and_store(chunks: list[str], user_id: str, filename: str) -> None:
+    """청크 임베딩 후 ChromaDB에 저장 (기존 user_id 데이터 먼저 삭제)."""
+    try:
+        # 기존 이력서 청크 삭제
+        existing = collection.get(where={"user_id": user_id})
+        if existing["ids"]:
+            collection.delete(ids=existing["ids"])
+
+        embeddings = [await get_embedding(chunk) for chunk in chunks]
+        ids = [str(uuid.uuid4()) for _ in chunks]
+        metadatas = [
+            {"user_id": user_id, "filename": filename, "chunk_index": i}
+            for i in range(len(chunks))
+        ]
+        collection.add(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="Ollama 서버에 연결할 수 없습니다.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"임베딩/저장 실패: {e}")
+
+
 # ── 스키마 ───────────────────────────────────────────────────
 class SearchRequest(BaseModel):
     query: str
@@ -163,19 +392,7 @@ async def embed_text(req: EmbedTextRequest):
     if not chunks:
         raise HTTPException(status_code=400, detail="텍스트가 비어 있습니다.")
 
-    try:
-        embeddings = [await get_embedding(chunk) for chunk in chunks]
-        ids = [str(uuid.uuid4()) for _ in chunks]
-        metadatas = [
-            {"user_id": req.user_id, "filename": req.filename, "chunk_index": i}
-            for i, _ in enumerate(chunks)
-        ]
-        collection.add(ids=ids, embeddings=embeddings, documents=chunks, metadatas=metadatas)
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Ollama 서버에 연결할 수 없습니다.")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"임베딩 실패: {e}")
-
+    await _embed_and_store(chunks, req.user_id, req.filename)
     return {"user_id": req.user_id, "chunks_stored": len(chunks)}
 
 
@@ -220,28 +437,7 @@ async def embed_resume(
         raise HTTPException(status_code=400, detail="파싱된 텍스트가 없습니다.")
 
     # 3. 임베딩 + ChromaDB 저장
-    try:
-        embeddings = []
-        for chunk in chunks:
-            emb = await get_embedding(chunk)
-            embeddings.append(emb)
-
-        ids = [str(uuid.uuid4()) for _ in chunks]
-        metadatas = [
-            {"user_id": user_id, "filename": file.filename, "chunk_index": i}
-            for i, _ in enumerate(chunks)
-        ]
-
-        collection.add(
-            ids=ids,
-            embeddings=embeddings,
-            documents=chunks,
-            metadatas=metadatas,
-        )
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="Ollama 서버에 연결할 수 없습니다. ollama serve 를 먼저 실행하세요.")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"임베딩/저장 실패: {e}")
+    await _embed_and_store(chunks, user_id, file.filename)
 
     return {
         "filename": file.filename,
@@ -320,31 +516,81 @@ async def generate_pool(req: GeneratePoolRequest):
     면접 시작 전 신규 질문 5개 생성 (카테고리 A 3개 + B 2개).
     질문 1개씩 개별 호출하여 토큰 깨짐 방지.
     """
-    import re
-
     resume_context = await retrieve_resume_context(req.user_id, "프로젝트 기술스택 경험")
     if not resume_context:
         raise HTTPException(status_code=400, detail="이력서 정보를 찾을 수 없습니다. 마이페이지에서 이력서를 먼저 업로드해 주세요.")
 
     system_msg = "You are a Korean interviewer. You MUST respond only in Korean (한국어). Never use English, Japanese, Chinese, or any other language. Use correct Korean spelling and spacing."
 
+    persona = _get_persona(req.interview_type)
+
+    import random
+
     if req.interview_type == "job":
-        persona = "17년 차 수석 개발자 면접관 '개발팀 김 팀장'"
+        # 신입 수준 CS 기초 주제 풀 (개념 설명 가능한 수준)
+        cs_topics_pool = [
+            "HTTP 메서드(GET/POST/PUT/DELETE)의 차이",
+            "HTTP와 HTTPS의 차이",
+            "프로세스와 스레드의 차이",
+            "RDB와 NoSQL의 차이와 사용 사례",
+            "DB 인덱스의 역할",
+            "TCP와 UDP의 차이",
+            "가비지 컬렉션(GC) 개념",
+            "RESTful API란 무엇인가",
+            "캐시의 역할과 필요성",
+            "동기와 비동기 처리 방식의 차이",
+            "트랜잭션과 ACID 속성",
+            "쿠키와 세션의 차이",
+            "JWT 인증 방식 개념",
+            "CI/CD란 무엇이며 왜 사용하는가",
+            "스택과 큐의 차이와 사용 예시",
+            "객체지향 프로그래밍의 4가지 특징",
+            "CORS란 무엇이며 왜 발생하는가",
+            "SQL의 JOIN 종류와 차이",
+            "웹 브라우저 주소창에 URL 입력 시 일어나는 일",
+            "MVC 패턴이란 무엇인가",
+        ]
+        selected_topics = random.sample(cs_topics_pool, 3)
         category_specs = [
-            ("A", "CS 기초 개념 질문 — 다음 중 하나 선택: HTTP 메서드/상태코드, 프로세스 vs 스레드, RDB vs NoSQL, DB 인덱스 역할, TCP vs UDP. 개념을 말로 설명하는 수준이며 코드 구현 요구 절대 금지. 신입 지원자가 답할 수 있는 난이도."),
-            ("A", "CS 기초 개념 질문 — 앞 질문과 다른 분야 선택: GC 가비지 컬렉션, HTTP vs HTTPS, RESTful API 개념, 캐시의 역할, OSI 7계층 중 하나. 개념 설명 수준, 코드 구현 요구 절대 금지."),
-            ("A", "CS 기초 개념 질문 — 앞 두 질문과 다른 분야 선택: 동기 vs 비동기, 트랜잭션 ACID, 세션 vs JWT, 로드밸런싱 개념, CI/CD 개념 중 하나. 개념 설명 수준, 코드 구현 요구 절대 금지."),
+            ("A", f"CS 기초 개념 질문 — 주제: [{selected_topics[0]}]. 개념을 말로 설명하는 수준. 코드 구현 요구 절대 금지. 신입 지원자가 답할 수 있는 쉬운 난이도."),
+            ("A", f"CS 기초 개념 질문 — 주제: [{selected_topics[1]}]. 개념 설명 수준. 코드 구현 요구 절대 금지. 신입 지원자가 답할 수 있는 쉬운 난이도."),
+            ("A", f"CS 기초 개념 질문 — 주제: [{selected_topics[2]}]. 개념 설명 수준. 코드 구현 요구 절대 금지. 신입 지원자가 답할 수 있는 쉬운 난이도."),
             ("B", "프로젝트/기술 역량 질문 — 이력서의 특정 프로젝트 기능을 어떤 방식으로 구현했는지·왜 그 방식을 선택했는지, 또는 현재 관심 있는 기술이나 최근 공부한 내용을 묻는 질문"),
             ("B", "프로젝트 심화 질문 — 이력서 프로젝트에서 가장 도전적이었던 부분과 해결 방법, 또는 팀 프로젝트 실패 경험과 교훈, 또는 버그 발견·테스트 프로세스를 묻는 질문. 앞 질문과 다른 주제."),
         ]
     else:
-        persona = "23년 차 임원 면접관 '박부장'"
+        personality_topics_pool = [
+            "개발자로서 5년/10년 후 목표",
+            "개발이 적성에 맞는 이유",
+            "개발자에게 가장 중요한 역량",
+            "주니어 개발자로서 가장 먼저 키우고 싶은 역량",
+            "압박감이 클 때 일하는 방식",
+            "본인의 강점이 직무와 맞는 이유",
+            "본인의 강점과 약점",
+            "실패 경험과 교훈",
+            "개발 외 자기계발 방법",
+            "최근 가장 흥미롭게 공부한 기술 주제",
+            "개발 프로젝트에서 가장 보람 있었던 순간",
+            "코딩을 시작하게 된 계기",
+        ]
+        teamwork_topics_pool = [
+            "팀 내 갈등 해결 경험",
+            "의견 충돌 시 팀원 설득 방법",
+            "팀 프로젝트에서 본인의 역할",
+            "효과적인 팀 커뮤니케이션 방법",
+            "업무 스타일이 다른 팀원과 협업 경험",
+            "팀 프로젝트에서 협력해 문제를 해결한 경험",
+            "스트레스·압박 상황 대처 방식",
+            "팀 프로젝트에서 일정이 밀렸을 때 대응 방법",
+        ]
+        selected_personality = random.sample(personality_topics_pool, 3)
+        selected_teamwork = random.sample(teamwork_topics_pool, 2)
         category_specs = [
-            ("A", "인성 질문 — 다음 중 하나 선택: 개발자로서 5년/10년 후 목표, 개발이 적성에 맞는 이유, 개발자에게 가장 중요한 역량, 주니어와 시니어 개발자의 차이, 압박감이 클 때 일하는 방식. 지원자의 가치관과 성장 의지를 파악하는 질문."),
-            ("A", "인성 질문 — 앞 질문과 다른 주제 선택: 자신의 역량이 직무와 맞는 이유, 본인의 강점과 약점, 실패 경험과 교훈, 개발 외 자기계발 방법 중 하나."),
-            ("A", "이력서/경험 기반 인성 질문 — 지원자의 실제 프로젝트·스터디·활동에서 배운 점이나 성취 경험을 묻는 질문. 앞 두 질문과 다른 주제."),
-            ("B", "팀워크/소프트스킬 질문 — 다음 중 하나 선택: 팀 내 갈등 해결 경험, 의견 충돌 시 팀원 설득 방법, 팀에서 본인의 역할, 효과적인 팀 커뮤니케이션 전략 중 하나."),
-            ("B", "팀워크/소프트스킬 질문 — 앞 질문과 다른 주제 선택: 업무 스타일이 다른 팀원과 협업 방법, 다른 개발자와 협력해 문제를 해결한 경험, 스트레스·압박 상황 대처 방식 중 하나."),
+            ("A", f"인성 질문 — 주제: [{selected_personality[0]}]. 지원자의 가치관과 성장 의지를 파악하는 질문."),
+            ("A", f"인성 질문 — 주제: [{selected_personality[1]}]."),
+            ("A", f"이력서/경험 기반 인성 질문 — 주제: [{selected_personality[2]}]. 지원자의 실제 경험을 기반으로."),
+            ("B", f"팀워크/소프트스킬 질문 — 주제: [{selected_teamwork[0]}]."),
+            ("B", f"팀워크/소프트스킬 질문 — 주제: [{selected_teamwork[1]}]."),
         ]
 
     resume_section = ""
@@ -353,10 +599,16 @@ async def generate_pool(req: GeneratePoolRequest):
 
     rules = (
         "규칙: "
-        "1) 질문은 1문장으로 짧고 간결하게. "
+        "1) 질문은 반드시 1문장, 1개의 질문만. 설명·배경·힌트를 앞에 붙이지 말 것. 두 개의 질문을 이어 붙이는 것 절대 금지. "
+        "1-1) 올바른 예: 'HTTP 메서드 GET과 POST의 차이를 설명해 주세요.' "
+        "1-2) 잘못된 예(절대 금지): 'GET은 데이터를 조회할 때 사용합니다. 각각의 차이를 설명해 주세요.' (앞에 설명 붙이는 것 금지) "
+        "1-3) 잘못된 예(절대 금지): 'ChromaDB 활용 방식을 설명해 주세요. 왜 이 방법을 선택하셨나요?' (두 질문 이어 붙이는 것 금지) "
         "2) ArrayList, Spring Boot 등 고유 기술 용어는 영어 가능. "
         "3) 나머지는 모두 한국어. "
-        "4) 자연스러운 면접 질문 형식으로 끝낼 것 (예: ~말씀해 주세요., ~설명해 주세요., ~있으신가요?). "
+        "4) 질문은 반드시 하나의 어미로만 끝낼 것. 어미가 두 개 이상이면 절대 안 됨. "
+        "4-1) 올바른 예: '트랜잭션이란 무엇인가요?' 또는 '동기와 비동기의 차이를 설명해 주세요.' "
+        "4-2) 잘못된 예(절대 금지): '트랜잭션이란 무엇인가요? 말씀해 주세요.' 또는 '차이를 설명해 주세요? 무엇인가요?' "
+        "4-3) 질문이 인가요/무엇인가요/있으신가요 중 하나로 끝났으면 그 뒤에 아무것도 붙이지 말 것. "
         "5) 띄어쓰기 정확히. "
         "6) 질문 텍스트만 출력하고 다른 말은 절대 하지 말 것. "
         "7) 코드 작성·구현을 요구하는 질문은 절대 생성하지 말 것."
@@ -413,8 +665,6 @@ async def generate_pool(req: GeneratePoolRequest):
 @app.post("/should-followup")
 async def should_followup(req: ShouldFollowupRequest):
     """꼬리 질문 여부 판단. current_followup_count >= 2이면 즉시 false 반환."""
-    import json
-
     if req.current_followup_count >= 2:
         return {"should_followup": False}
 
@@ -429,9 +679,7 @@ async def should_followup(req: ShouldFollowupRequest):
 
     raw = await call_llm([{"role": "user", "content": prompt}])
     try:
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        parsed = json.loads(raw[start:end])
+        parsed = _extract_json(raw)
         return {"should_followup": bool(parsed.get("should_followup", False))}
     except Exception:
         return {"should_followup": False}
@@ -440,17 +688,13 @@ async def should_followup(req: ShouldFollowupRequest):
 @app.post("/generate-followup")
 async def generate_followup(req: GenerateFollowupRequest):
     """꼬리 질문 생성 (부모 질문 + 사용자 답변 컨텍스트)."""
-    if req.interview_type == "job":
-        persona = "17년 차 수석 개발자 면접관 '개발팀 김 팀장'"
-    else:
-        persona = "23년 차 임원 면접관 '박부장'"
-
     prompt = (
-        f"당신은 {persona}입니다.\n"
+        f"당신은 {_get_persona(req.interview_type)}입니다.\n"
         f"면접관 질문: {req.parent_question}\n"
         f"지원자 답변: {req.user_answer}\n\n"
-        "위 답변에서 더 구체적으로 파고들 부분을 찾아 꼬리 질문 1개를 작성하세요. "
-        "질문만 출력하고 다른 내용은 포함하지 마세요. 존댓말로 작성하세요. "
+        "위 답변 중 가장 불명확하거나 짧게 언급된 부분 한 가지에 대해 간단한 꼬리 질문 1개를 작성하세요. "
+        "질문은 짧고 간결하게 한 문장으로, 존댓말로 작성하세요. "
+        "질문 텍스트만 출력하고 다른 내용은 절대 포함하지 마세요. "
         "반드시 한국어로만 작성하고, 영어 번역이나 설명을 절대 포함하지 마세요."
     )
 
@@ -467,8 +711,6 @@ async def evaluate_answer(req: EvaluateAnswerRequest):
     답변 품질 평가 → "GOOD" | "POOR" 반환.
     평가 기준: 답변의 구체성, 완결성, 질문 관련성.
     """
-    import json
-
     prompt = (
         "다음 면접 질문과 답변을 평가하세요.\n\n"
         f"질문: {req.question_text}\n"
@@ -483,9 +725,7 @@ async def evaluate_answer(req: EvaluateAnswerRequest):
 
     raw = await call_llm([{"role": "user", "content": prompt}])
     try:
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        parsed = json.loads(raw[start:end])
+        parsed = _extract_json(raw)
         quality = "POOR" if parsed.get("should_retry", False) else "GOOD"
     except Exception:
         quality = "GOOD"
@@ -520,8 +760,6 @@ async def generate_feedback(req: GenerateFeedbackRequest):
     - 소프트스킬 카테고리별 루브릭 기반 채점 (score + evidence + weakness)
     - 질문별: 질문 의도, 답변 피드백, 개선된 답변
     """
-    import json
-
     interviewer = "개발팀 김 팀장 (17년 차 수석 개발자)" if req.interview_type == "job" else "박부장 (23년 차 임원)"
     skill_keys = list(SKILL_RUBRICS.get(req.interview_type, SKILL_RUBRICS["job"]).keys())
     rubrics = SKILL_RUBRICS.get(req.interview_type, SKILL_RUBRICS["job"])
@@ -542,7 +780,7 @@ async def generate_feedback(req: GenerateFeedbackRequest):
     for q in req.questions:
         question_schema_lines.append(
             '    {"question_id": ' + str(q.question_id) +
-            ', "intent": "이 질문의 의도", "feedback": "이 답변에 대한 구체적 피드백", "improved_answer": "90점 이상의 모범 답변을 1인칭으로 직접 작성 (메타 설명 금지, 실제 답변 문장으로 작성)"}'
+            ', "answer_summary": "지원자 답변을 1~2문장으로 요약 (핵심 내용만, 없거나 무의미한 답변이면 \'답변 없음\')", "intent": "이 질문의 의도", "feedback": "이 답변에 대한 구체적 피드백", "improved_answer": "90점 이상의 모범 답변을 1인칭으로 직접 작성 (메타 설명 금지, 실제 답변 문장으로 작성)"}'
         )
     question_schema = ",\n".join(question_schema_lines)
 
@@ -585,10 +823,7 @@ async def generate_feedback(req: GenerateFeedbackRequest):
     ], timeout=120)
 
     try:
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        parsed = json.loads(raw[start:end])
-        return parsed
+        return _extract_json(raw)
     except Exception:
         # 파싱 실패 시 기본 구조 반환
         return {
@@ -600,6 +835,7 @@ async def generate_feedback(req: GenerateFeedbackRequest):
             "questions": [
                 {
                     "question_id": q.question_id,
+                    "answer_summary": "",
                     "intent": "질문 의도를 분석할 수 없습니다.",
                     "feedback": "피드백을 생성할 수 없습니다.",
                     "improved_answer": "개선된 답변을 생성할 수 없습니다."
@@ -644,7 +880,7 @@ _TECH_KO = {
     "spring":"스프링", "react":"리액트", "vue":"뷰", "angular":"앵귤러",
     "nodejs":"노드제이에스", "django":"장고", "flask":"플라스크",
     "mysql":"마이에스큐엘", "postgresql":"포스트그레에스큐엘",
-    "redis":"레디스", "mongodb":"몽고디비",
+    "redis":"레디스", "mongodb":"몽고디비", "chromadb":"크로마디비",
     "kafka":"카프카", "rabbitmq":"래빗엠큐",
     "nginx":"엔진엑스", "apache":"아파치",
     "msa":"엠에스에이", "devops":"데브옵스",
@@ -659,6 +895,10 @@ _TECH_KO = {
     "whisper":"위스퍼", "edge-tts":"엣지 티티에스",
     "mediapipe":"미디어파이프", "pymupdf":"파이엠유피디에프",
     "get":"겟", "post":"포스트", "put":"풋", "delete":"딜리트",
+    "ollama":"올라마", "exaone":"엑사원",
+    "python":"파이썬", "java":"자바", "javascript":"자바스크립트",
+    "typescript":"타입스크립트", "csharp":"씨샵", "cpp":"씨플플",
+    "inner":"이너", "outer":"아우터", "join":"조인", "left":"레프트", "right":"라이트", "full":"풀",   
 }
 
 def _word_to_ko(word: str) -> str:
@@ -671,7 +911,10 @@ def _word_to_ko(word: str) -> str:
 
 def preprocess_tts_korean(text: str) -> str:
     """한국어 TTS 전달 전 영어 단어를 한국어 발음으로 치환."""
-    import re
+    # 괄호 안 텍스트 제거 (소괄호/대괄호/중괄호)
+    text = re.sub(r'\([^)]*\)', '', text)
+    text = re.sub(r'\[[^\]]*\]', '', text)
+    text = re.sub(r'\{[^}]*\}', '', text)
     # URL 전체를 먼저 제거 (주소 자체를 읽으면 너무 길어짐)
     text = re.sub(r'https?://\S+', '링크', text)
     # 영문+숫자 혼합 단어 처리 (예: Node.js, k8s, CI/CD)
@@ -697,6 +940,59 @@ async def text_to_speech(req: TTSRequest):
             buf.write(chunk["data"])
     buf.seek(0)
     return StreamingResponse(buf, media_type="audio/mpeg")
+
+
+@app.post("/stt")
+async def speech_to_text(
+    audio: UploadFile = File(...),
+    language: str = Form("ko"),
+    desired_job: str = Form(""),
+):
+    """음성 파일을 faster-whisper로 텍스트 변환해 반환. 음성 분석 지표도 함께 반환."""
+    suffix = Path(audio.filename).suffix if audio.filename else ".webm"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(await audio.read())
+        tmp_path = tmp.name
+    try:
+        lang_code = language if language in ("ko", "en") else "ko"
+        initial_prompt = _get_stt_prompt(desired_job, lang_code)
+        loop = asyncio.get_event_loop()
+        def run_transcribe():
+            segs, _ = whisper_model.transcribe(
+                tmp_path,
+                language=lang_code,
+                initial_prompt=initial_prompt,
+                beam_size=5,
+                vad_filter=True,
+            )
+            segs_list = list(segs)
+            text = " ".join(seg.text for seg in segs_list).strip()
+
+            # 음성 분석 지표 계산
+            speech_duration = round(sum(seg.end - seg.start for seg in segs_list), 2)
+            total_duration = round(
+                (segs_list[-1].end - segs_list[0].start) if segs_list else 0.0, 2
+            )
+            # 한국어 음절 수(가-힣 문자 수) 기반 SPM 계산
+            syllable_count = len(re.findall(r'[가-힣]', text))
+            spm = round(syllable_count / speech_duration * 60) if speech_duration > 0 else 0
+
+            return text, speech_duration, total_duration, spm
+
+        text, speech_duration, total_duration, spm = \
+            await loop.run_in_executor(None, run_transcribe)
+        if lang_code == "ko":
+            text = correct_stt_text(text)
+    finally:
+        os.unlink(tmp_path)
+    return {
+        "text": text,
+        "voice_data": {
+            "speechDuration": speech_duration,
+            "totalDuration": total_duration,
+            "spm": spm,
+        },
+    }
 
 
 if __name__ == "__main__":

@@ -6,3 +6,4 @@ python-multipart
 httpx==0.28.1
 chromadb
 edge-tts
+faster-whisper
