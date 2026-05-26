@@ -16,8 +16,10 @@ import uuid
 import tempfile
 from pathlib import Path
 from faster_whisper import WhisperModel
+import numpy as np
+import librosa
 
-# ── 앱 초기화 ───────────────────────────────────────────────
+# 앱 초기화
 app = FastAPI()
 
 app.add_middleware(
@@ -28,18 +30,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── ChromaDB 초기화 (로컬 영구 저장) ────────────────────────
+# ChromaDB 초기화 (로컬 영구 저장)
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 collection = chroma_client.get_or_create_collection(
     name="resumes",
     metadata={"hnsw:space": "cosine"},
 )
 
-# ── Whisper STT 모델 초기화 ─────────────────────────────────
+# Whisper STT 모델 초기화
 _WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")
 whisper_model = WhisperModel(_WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
 
-# ── 직군별 STT initial_prompt ───────────────────────────────
+# 직군별 STT prompt
 # Whisper가 이 어휘 분포를 기반으로 기술 용어를 우선 인식
 
 _STT_PROMPTS_KO: dict[str, str] = {
@@ -48,7 +50,8 @@ _STT_PROMPTS_KO: dict[str, str] = {
         "REST API, JPA, 하이버네이트, 마이크로서비스 아키텍처, MSA를 경험했습니다. "
         "MySQL, PostgreSQL, Redis, MongoDB 등 데이터베이스를 다루며, "
         "도커, 쿠버네티스, CI/CD, AWS 클라우드에 배포한 경험이 있습니다. "
-        "알고리즘, 자료구조, 객체지향 프로그래밍, 디자인 패턴, 트랜잭션, 인덱스를 공부했습니다."
+        "알고리즘, 자료구조, 객체지향 프로그래밍, 디자인 패턴, 트랜잭션, 인덱스를 공부했습니다. "
+        "캡슐화, 상속, 다형성, 추상화, 인터페이스, 추상 클래스를 이해합니다."
     ),
     "frontend": (
         "저는 프론트엔드 개발자로 리액트, 뷰, 앵귤러, 타입스크립트를 사용합니다. "
@@ -100,33 +103,10 @@ _STT_PROMPTS_KO: dict[str, str] = {
     "default": (
         "저는 소프트웨어 개발자입니다. "
         "알고리즘, 자료구조, 객체지향 프로그래밍, 디자인 패턴을 공부했습니다. "
+        "캡슐화, 상속, 다형성, 추상화는 객체지향의 4대 원칙입니다. "
         "자바, 파이썬, 자바스크립트, 타입스크립트, C 플플 중 하나 이상을 사용합니다. "
         "데이터베이스, REST API, 깃허브, 도커, 클라우드 환경을 경험했습니다. "
         "트러블슈팅, 리팩토링, 코드 리뷰, 애자일 방법론에 익숙합니다."
-    ),
-}
-
-_STT_PROMPTS_EN: dict[str, str] = {
-    "backend": (
-        "I'm a backend developer using Java, Spring Boot, Python, Django, Node.js. "
-        "REST APIs, JPA, Hibernate, microservices, MySQL, PostgreSQL, Redis, MongoDB. "
-        "Docker, Kubernetes, CI/CD, AWS, algorithms, data structures, design patterns."
-    ),
-    "frontend": (
-        "I'm a frontend developer using React, Vue, Angular, TypeScript, JavaScript. "
-        "Webpack, Vite, Redux, Recoil, React Query, HTML, CSS, responsive design, SEO."
-    ),
-    "data": (
-        "I'm a data scientist using Python, Pandas, NumPy, scikit-learn, TensorFlow, PyTorch. "
-        "Machine learning, deep learning, NLP, computer vision, SQL, Spark, Kafka, MLOps."
-    ),
-    "devops": (
-        "I'm a DevOps engineer using Docker, Kubernetes, Helm, Terraform, Ansible. "
-        "AWS, GCP, Azure, CI/CD, GitHub Actions, Jenkins, ArgoCD, Prometheus, Grafana."
-    ),
-    "default": (
-        "I'm a software engineer. Algorithms, data structures, object-oriented programming, design patterns. "
-        "Java, Python, JavaScript, TypeScript, databases, REST APIs, Git, Docker, cloud deployment."
     ),
 }
 
@@ -150,13 +130,12 @@ def _resolve_job_keys(desired_job: str) -> list[str]:
     matched = [key for keywords, key in _JOB_KEYWORD_MAP if any(kw in lower for kw in keywords)]
     return matched if matched else ["default"]
 
-def _get_stt_prompt(desired_job: str, language: str) -> str:
+def _get_stt_prompt(desired_job: str) -> str:
     keys = _resolve_job_keys(desired_job)
-    prompts = _STT_PROMPTS_EN if language == "en" else _STT_PROMPTS_KO
+    prompts = _STT_PROMPTS_KO
     if len(keys) == 1:
         return prompts.get(keys[0], prompts["default"])
     # 여러 직군 매칭 시: 각 프롬프트의 첫 문장만 결합
-    # (Whisper initial_prompt는 어휘 프라이밍 목적 — 짧게 유지)
     parts = []
     for key in keys:
         full = prompts.get(key, "")
@@ -165,7 +144,7 @@ def _get_stt_prompt(desired_job: str, language: str) -> str:
             parts.append(first_sentence)
     return " ".join(parts) if parts else prompts["default"]
 
-# STT 후처리 보정 사전 (발음 유사어 → 정규 표기)
+# STT 후처리 보정
 _STT_CORRECTIONS_KO = {
     # 프레임워크 / 언어
     "리엑트": "리액트",
@@ -191,7 +170,7 @@ _STT_CORRECTIONS_KO = {
     "카프": "카프카",
     # CS 개념
     "알로리즘": "알고리즘",
-    "알고리즘": "알고리즘",  # 정규화 (중복 방지)
+    "알고리즘": "알고리즘",
     "자료구": "자료구조",
     "오브젝 지향": "객체지향",
     "오브젝트지향": "객체지향",
@@ -213,6 +192,25 @@ _STT_CORRECTIONS_KO = {
     "로드밸런싱": "로드 밸런싱",
     "캐슁": "캐싱",
     "리팩토링": "리팩토링",
+    "캡시라": "캡슐화",
+    "캡슬화": "캡슐화",
+    "캡쓸화": "캡슐화",
+    "캡슈화": "캡슐화",
+    "캡슐하": "캡슐화",
+    "갭슐화": "캡슐화",
+    "다형": "다형성",
+    "다형싱": "다형성",
+    "다형선": "다형성",
+    "추상하": "추상화",
+    "추상하": "추상화",
+    "상속성": "상속",
+    "인터페이": "인터페이스",
+    "인터페이쓰": "인터페이스",
+    "인터패이스": "인터페이스",
+    "폴리모피즘": "다형성",
+    "인캡슐레이션": "캡슐화",
+    "어브스트랙션": "추상화",
+    "이너히어런스": "상속",
 }
 
 def correct_stt_text(text: str) -> str:
@@ -227,7 +225,7 @@ LLM_MODEL  = os.getenv("LLM_MODEL",  "exaone3.5")
 CHUNK_SIZE   = 500
 CHUNK_OVERLAP = 50
 
-# ── 면접관 시스템 프롬프트 ────────────────────────────────────
+# 면접관 시스템 프롬프트
 BASIC_SYSTEM = (
     "당신은 50대 여성 임원이자 23년 차 베테랑 면접관 '박부장'입니다. "
     "인성, 조직 적합성, 갈등 해결 능력, 스트레스 관리 등을 평가합니다. "
@@ -255,9 +253,8 @@ JOB_SYSTEM = (
 )
 
 
-# ── 유틸 함수 ────────────────────────────────────────────────
+# 유틸 함수
 def chunk_text(text: str) -> list[str]:
-    """단락 우선, 길면 CHUNK_SIZE 기준으로 분할."""
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     chunks = []
     current = ""
@@ -267,7 +264,6 @@ def chunk_text(text: str) -> list[str]:
         else:
             if current:
                 chunks.append(current)
-            # 단락 자체가 CHUNK_SIZE 초과 시 강제 분할
             while len(para) > CHUNK_SIZE:
                 chunks.append(para[:CHUNK_SIZE])
                 para = para[CHUNK_SIZE - CHUNK_OVERLAP:]
@@ -278,7 +274,6 @@ def chunk_text(text: str) -> list[str]:
 
 
 async def get_embedding(text: str) -> list[float]:
-    """Ollama 임베딩 API 호출."""
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             f"{OLLAMA_URL}/api/embed",
@@ -286,28 +281,24 @@ async def get_embedding(text: str) -> list[float]:
         )
         resp.raise_for_status()
         data = resp.json()
-        # Ollama /api/embed 응답: {"embeddings": [[...]] }
         return data["embeddings"][0]
 
 
 def _get_persona(interview_type: str) -> str:
-    """면접 유형에 따른 페르소나 문자열 반환."""
     if interview_type == "job":
         return "17년 차 수석 개발자 면접관 '개발팀 김 팀장'"
     return "23년 차 임원 면접관 '박부장'"
 
 
 def _extract_json(raw: str) -> dict:
-    """LLM 응답에서 JSON 객체를 추출해 파싱. 실패 시 빈 dict 반환."""
     start = raw.find("{")
     end = raw.rfind("}") + 1
     if start == -1 or end == 0:
-        return {}
+        raise ValueError(f"No JSON object found in LLM response: {raw[:200]}")
     return json.loads(raw[start:end])
 
 
 async def _embed_and_store(chunks: list[str], user_id: str, filename: str) -> None:
-    """청크 임베딩 후 ChromaDB에 저장 (기존 user_id 데이터 먼저 삭제)."""
     try:
         # 기존 이력서 청크 삭제
         existing = collection.get(where={"user_id": user_id})
@@ -327,7 +318,7 @@ async def _embed_and_store(chunks: list[str], user_id: str, filename: str) -> No
         raise HTTPException(status_code=500, detail=f"임베딩/저장 실패: {e}")
 
 
-# ── 스키마 ───────────────────────────────────────────────────
+# 스키마
 class SearchRequest(BaseModel):
     query: str
     user_id: str | None = None
@@ -342,7 +333,7 @@ class EmbedTextRequest(BaseModel):
 
 class GeneratePoolRequest(BaseModel):
     user_id: str
-    interview_type: str          # "basic" | "job"
+    interview_type: str
 
 
 
@@ -379,7 +370,7 @@ class GenerateFeedbackRequest(BaseModel):
     questions: list[FeedbackQuestion]
 
 
-# ── 엔드포인트 ───────────────────────────────────────────────
+# 엔드포인트
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
@@ -387,7 +378,6 @@ async def health_check():
 
 @app.post("/embed-text")
 async def embed_text(req: EmbedTextRequest):
-    """마크다운 텍스트 → 청크 → 임베딩 → ChromaDB 저장."""
     chunks = chunk_text(req.text)
     if not chunks:
         raise HTTPException(status_code=400, detail="텍스트가 비어 있습니다.")
@@ -398,7 +388,6 @@ async def embed_text(req: EmbedTextRequest):
 
 @app.post("/parse-resume")
 async def parse_resume(file: UploadFile = File(...)):
-    """PDF → Markdown 변환만 수행 (저장 없음)."""
     temp_path = f"temp_{file.filename}"
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -417,7 +406,6 @@ async def embed_resume(
     file: UploadFile = File(...),
     user_id: str = Form(...),
 ):
-    """PDF → Markdown → 청크 → 임베딩 → ChromaDB 저장."""
     temp_path = f"temp_{file.filename}"
     with open(temp_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -449,7 +437,6 @@ async def embed_resume(
 
 @app.post("/search")
 async def search(req: SearchRequest):
-    """쿼리 → 임베딩 → ChromaDB 유사도 검색."""
     try:
         query_emb = await get_embedding(req.query)
     except httpx.ConnectError:
@@ -476,7 +463,6 @@ async def search(req: SearchRequest):
 
 
 async def retrieve_resume_context(user_id: str, query: str, top_k: int = 4) -> str:
-    """ChromaDB에서 이력서 관련 청크를 검색해 컨텍스트 문자열로 반환."""
     try:
         query_emb = await get_embedding(query)
         results = collection.query(
@@ -495,7 +481,6 @@ async def retrieve_resume_context(user_id: str, query: str, top_k: int = 4) -> s
 
 
 async def call_llm(messages: list, timeout: int = 180) -> str:
-    """LLM(Ollama) 호출 공통 함수."""
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(
@@ -512,22 +497,15 @@ async def call_llm(messages: list, timeout: int = 180) -> str:
 
 @app.post("/generate-pool")
 async def generate_pool(req: GeneratePoolRequest):
-    """
-    면접 시작 전 신규 질문 5개 생성 (카테고리 A 3개 + B 2개).
-    질문 1개씩 개별 호출하여 토큰 깨짐 방지.
-    """
     resume_context = await retrieve_resume_context(req.user_id, "프로젝트 기술스택 경험")
     if not resume_context:
         raise HTTPException(status_code=400, detail="이력서 정보를 찾을 수 없습니다. 마이페이지에서 이력서를 먼저 업로드해 주세요.")
-
-    system_msg = "You are a Korean interviewer. You MUST respond only in Korean (한국어). Never use English, Japanese, Chinese, or any other language. Use correct Korean spelling and spacing."
 
     persona = _get_persona(req.interview_type)
 
     import random
 
     if req.interview_type == "job":
-        # 신입 수준 CS 기초 주제 풀 (개념 설명 가능한 수준)
         cs_topics_pool = [
             "HTTP 메서드(GET/POST/PUT/DELETE)의 차이",
             "HTTP와 HTTPS의 차이",
@@ -596,6 +574,8 @@ async def generate_pool(req: GeneratePoolRequest):
     resume_section = ""
     if resume_context:
         resume_section = f"\n[지원자 이력서 발췌 - 참고용]\n{resume_context}\n"
+
+    system_msg = "You are a Korean interviewer. You MUST respond only in Korean (한국어). Never use English, Japanese, Chinese, or any other language. Use correct Korean spelling and spacing."
 
     rules = (
         "규칙: "
@@ -732,8 +712,6 @@ async def evaluate_answer(req: EvaluateAnswerRequest):
 
     return {"quality": quality}
 
-
-# 소프트스킬 채점 루브릭 — 역량별 점수 구간 기준
 SKILL_RUBRICS = {
     "job": {
         "기술깊이":    "90+: 개념·원리 명확, 실사용 경험을 구체적 수치·사례로 뒷받침, 한계/트레이드오프 인지 | 70~89: 개념 정확하나 실사용 경험 추상적 | 50~69: 부분 이해, 오개념 혼재 | ~49: 핵심 벗어남·암기 수준·한 단어·무응답",
@@ -754,12 +732,6 @@ SKILL_RUBRICS = {
 
 @app.post("/generate-feedback")
 async def generate_feedback(req: GenerateFeedbackRequest):
-    """
-    면접 종합 피드백 생성.
-    - 면접 총평 (summary)
-    - 소프트스킬 카테고리별 루브릭 기반 채점 (score + evidence + weakness)
-    - 질문별: 질문 의도, 답변 피드백, 개선된 답변
-    """
     interviewer = "개발팀 김 팀장 (17년 차 수석 개발자)" if req.interview_type == "job" else "박부장 (23년 차 임원)"
     skill_keys = list(SKILL_RUBRICS.get(req.interview_type, SKILL_RUBRICS["job"]).keys())
     rubrics = SKILL_RUBRICS.get(req.interview_type, SKILL_RUBRICS["job"])
@@ -772,7 +744,7 @@ async def generate_feedback(req: GenerateFeedbackRequest):
     rubric_guide = "\n".join(f"  · {skill}: {desc}" for skill, desc in rubrics.items())
 
     skill_schema_entries = "\n".join(
-        f'    "{c}": {{"score": 정수(0~100), "evidence": "이 점수를 매긴 근거 (답변 내용 직접 인용)", "weakness": "이 역량에서 부족한 점 (없으면 빈 문자열)"}}'
+        f'    "{c}": {{"score": 정수(0~100), "evidence": "잘한 점·강점만 1~2문장. 부족한 점 포함 절대 금지. 역접 접속사(그러나/하지만/하였으나/이지만/하나/다만/반면/그런데/단/아쉽게도) 절대 금지. 없으면 빈 문자열", "weakness": "부족한 점·개선점만 1~2문장. 긍정 내용 포함 절대 금지. 없으면 빈 문자열"}}'
         for c in skill_keys
     )
 
@@ -780,7 +752,7 @@ async def generate_feedback(req: GenerateFeedbackRequest):
     for q in req.questions:
         question_schema_lines.append(
             '    {"question_id": ' + str(q.question_id) +
-            ', "answer_summary": "지원자 답변을 1~2문장으로 요약 (핵심 내용만, 없거나 무의미한 답변이면 \'답변 없음\')", "intent": "이 질문의 의도", "feedback": "이 답변에 대한 구체적 피드백", "improved_answer": "90점 이상의 모범 답변을 1인칭으로 직접 작성 (메타 설명 금지, 실제 답변 문장으로 작성)"}'
+            ', "answer_summary": "지원자가 실제로 말한 내용만 1~2문장으로 요약. 평가·피드백·개선 방향·부족한 점 포함 절대 금지. 없거나 무의미한 답변이면 \'답변 없음\'", "intent": "이 질문의 의도", "feedback": "이 답변에 대한 구체적 피드백", "improved_answer": "90점 이상의 모범 답변을 1인칭으로 직접 작성 (메타 설명 금지, 실제 답변 문장으로 작성)"}'
         )
     question_schema = ",\n".join(question_schema_lines)
 
@@ -802,12 +774,16 @@ async def generate_feedback(req: GenerateFeedbackRequest):
         "【소프트스킬 채점 루브릭】\n"
         f"{rubric_guide}\n\n"
         "위 루브릭을 기준으로 각 역량을 채점하세요. score는 루브릭 구간에 맞게 정수로, "
-        "evidence는 이 점수를 준 근거를 1~2문장으로 간결하게, weakness는 부족한 점을 1~2문장으로 간결하게 작성하세요. "
-        "evidence와 weakness 모두 '질문 N번에서' 또는 '질문 N과 M에서'처럼 특정 질문 번호를 언급하지 마세요. "
-        "전반적인 답변 경향을 기준으로 작성하세요.\n\n"
+        "【evidence 작성 규칙 — 반드시 준수】\n"
+        "evidence = 잘한 점·강점만. 부정적 내용 단 한 글자도 포함 금지.\n"
+        "금지 접속사: 그러나, 하지만, 하였으나, 이지만, 하나, 다만, 반면, 그런데, 단, 아쉽게도 — 이 중 하나라도 사용하면 틀린 답변임.\n"
+        "잘한 점이 없으면 evidence = 빈 문자열.\n"
+        "【weakness 작성 규칙 — 반드시 준수】\n"
+        "weakness = 부족한 점·개선점만. 긍정적 내용 단 한 글자도 포함 금지.\n"
+        "evidence와 weakness 모두 특정 질문 번호를 언급하지 말고 전반적 경향으로 작성하세요.\n\n"
         "위 면접 전체를 분석하여 다음 JSON 형식으로만 응답하세요. JSON 외 다른 텍스트는 절대 포함하지 마세요:\n\n"
         "{\n"
-        '  "summary": "면접 전체에 대한 2~3문장 총평 (실제 답변 품질을 솔직하게 반영)",\n'
+        '  "summary": {"strengths": "이 면접에서 잘한 점·강점만 2~3문장. 부정적 내용·역접 접속사 절대 금지.", "improvements": "이 면접에서 개선이 필요한 점·보완할 점만 2~3문장. 긍정적 내용 절대 금지."},\n'
         '  "softskill_analysis": {\n'
         f"{skill_schema_entries}\n"
         "  },\n"
@@ -827,7 +803,7 @@ async def generate_feedback(req: GenerateFeedbackRequest):
     except Exception:
         # 파싱 실패 시 기본 구조 반환
         return {
-            "summary": "면접이 완료되었습니다.",
+            "summary": {"strengths": "", "improvements": "면접이 완료되었습니다."},
             "softskill_analysis": {
                 c: {"score": 70, "evidence": "", "weakness": ""}
                 for c in skill_keys
@@ -844,8 +820,6 @@ async def generate_feedback(req: GenerateFeedbackRequest):
             ]
         }
 
-
-# 알파벳 → 한국어 발음 매핑
 _LETTER_KO = {
     'a':'에이','b':'비','c':'씨','d':'디','e':'이','f':'에프','g':'지',
     'h':'에이치','i':'아이','j':'제이','k':'케이','l':'엘','m':'엠',
@@ -853,7 +827,6 @@ _LETTER_KO = {
     'u':'유','v':'브이','w':'더블유','x':'엑스','y':'와이','z':'지',
 }
 
-# 기술 용어 사전 (소문자 키)
 _TECH_KO = {
     "HTTP":"에이치티티피", "HTTPS":"에이치티티피에스",
     "api":"에이피아이", "apis":"에이피아이",
@@ -902,7 +875,6 @@ _TECH_KO = {
 }
 
 def _word_to_ko(word: str) -> str:
-    """단어를 한국어 발음으로 변환. 사전 → 알파벳 한 글자씩 fallback."""
     lower = word.lower()
     if lower in _TECH_KO:
         return _TECH_KO[lower]
@@ -910,7 +882,6 @@ def _word_to_ko(word: str) -> str:
     return " ".join(_LETTER_KO.get(c, c) for c in lower if c.isalpha())
 
 def preprocess_tts_korean(text: str) -> str:
-    """한국어 TTS 전달 전 영어 단어를 한국어 발음으로 치환."""
     # 괄호 안 텍스트 제거 (소괄호/대괄호/중괄호)
     text = re.sub(r'\([^)]*\)', '', text)
     text = re.sub(r'\[[^\]]*\]', '', text)
@@ -942,20 +913,109 @@ async def text_to_speech(req: TTSRequest):
     return StreamingResponse(buf, media_type="audio/mpeg")
 
 
+# 음성 분석 헬퍼 함수
+
+def _load_audio_av(audio_path: str, sr: int = 16000) -> tuple[np.ndarray, int]:
+    import av, io, gc
+    resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=sr)
+    raw_buffer = io.BytesIO()
+    with av.open(audio_path, mode="r", metadata_errors="ignore") as container:
+        for frame in container.decode(audio=0):
+            for out_frame in resampler.resample(frame):
+                raw_buffer.write(out_frame.to_ndarray().tobytes())
+    del resampler
+    gc.collect()
+    audio = np.frombuffer(raw_buffer.getbuffer(), dtype=np.int16).astype(np.float32) / 32768.0
+    return audio, sr
+
+
+def _analyze_pitch(audio_path: str) -> tuple[float, float]:
+    try:
+        y, sr = _load_audio_av(audio_path)
+        f0 = librosa.yin(y, fmin=80, fmax=400, sr=sr)
+        valid = f0[(f0 > 80) & (f0 < 400)]
+        if len(valid) == 0:
+            return 0.0, 0.0
+        return round(float(np.mean(valid)), 1), round(float(np.std(valid)), 1)
+    except Exception as e:
+        print(f"[STT] pitch analysis error: {e}")
+        return 0.0, 0.0
+
+
+def _analyze_pauses(audio_path: str) -> tuple[int, float]:
+    try:
+        y, sr = _load_audio_av(audio_path)
+        intervals = librosa.effects.split(y, top_db=30)
+        if len(intervals) < 2:
+            return 0, 0.0
+        gaps = []
+        for i in range(1, len(intervals)):
+            gap_sec = (intervals[i][0] - intervals[i - 1][1]) / sr
+            if gap_sec >= 0.3:
+                gaps.append(round(gap_sec, 2))
+        if not gaps:
+            return 0, 0.0
+        return len(gaps), round(sum(gaps) / len(gaps), 2)
+    except Exception as e:
+        print(f"[STT] pause analysis error: {e}")
+        return 0, 0.0
+
+
+_FILLER_PATTERN = re.compile(
+    r'(?<![가-힣a-zA-Z])(음+|어+|아+|뭐+|있잖아|그니까|그러니까|아무튼|어쨌든)(?![가-힣a-zA-Z])'
+)
+
+def _detect_fillers(text: str, speech_duration: float) -> tuple[int, float]:
+    matches = _FILLER_PATTERN.findall(text)
+    count = len(matches)
+    rate = round(count / speech_duration * 60, 1) if speech_duration > 0 else 0.0
+    return count, rate
+
+
+_STAR_KEYWORDS = {
+    "S": ["상황", "경험", "있었", "그때", "당시", "처음에", "발생"],
+    "T": ["목표", "과제", "문제", "해결해야", "필요", "요구"],
+    "A": ["했습니다", "진행", "구현", "처리", "적용", "시도", "선택", "작성"],
+    "R": ["결과", "달성", "완료", "배웠", "개선", "성공", "해결"],
+}
+
+def _detect_star(text: str) -> int:
+    return sum(
+        1 for keywords in _STAR_KEYWORDS.values()
+        if any(kw in text for kw in keywords)
+    )
+
+
+def _calc_stress(filler_rate: float, pause_count: int, speech_duration: float, pitch_std: float) -> int:
+    # 필러: 분당 10회 이상이면 만점
+    filler_score = min(filler_rate / 10.0, 1.0) * 40
+    # 침묵: speech_duration 대비 pause_count 비율
+    pause_ratio = (pause_count / speech_duration * 10) if speech_duration > 0 else 0
+    pause_score = min(pause_ratio, 1.0) * 30
+    # 음고 떨림: std 50Hz 이상이면 만점
+    pitch_score = min(pitch_std / 50.0, 1.0) * 30
+    return round(filler_score + pause_score + pitch_score)
+
+
+def _calc_cognitive_load(filler_rate: float, pause_count: int, speech_duration: float) -> int:
+    filler_score = min(filler_rate / 10.0, 1.0) * 50
+    pause_density = (pause_count / speech_duration * 10) if speech_duration > 0 else 0
+    pause_score = min(pause_density, 1.0) * 50
+    return round(filler_score + pause_score)
+
+
 @app.post("/stt")
 async def speech_to_text(
     audio: UploadFile = File(...),
-    language: str = Form("ko"),
     desired_job: str = Form(""),
 ):
-    """음성 파일을 faster-whisper로 텍스트 변환해 반환. 음성 분석 지표도 함께 반환."""
     suffix = Path(audio.filename).suffix if audio.filename else ".webm"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(await audio.read())
         tmp_path = tmp.name
     try:
-        lang_code = language if language in ("ko", "en") else "ko"
-        initial_prompt = _get_stt_prompt(desired_job, lang_code)
+        lang_code = "ko"
+        initial_prompt = _get_stt_prompt(desired_job)
         loop = asyncio.get_event_loop()
         def run_transcribe():
             segs, _ = whisper_model.transcribe(
@@ -964,22 +1024,46 @@ async def speech_to_text(
                 initial_prompt=initial_prompt,
                 beam_size=5,
                 vad_filter=True,
+                condition_on_previous_text=False,  # 이전 컨텍스트 의존 제거 → 필러 단어 억제 방지
             )
             segs_list = list(segs)
             text = " ".join(seg.text for seg in segs_list).strip()
 
-            # 음성 분석 지표 계산
+            # Layer 1: 말 속도 (SPM)
             speech_duration = round(sum(seg.end - seg.start for seg in segs_list), 2)
             total_duration = round(
                 (segs_list[-1].end - segs_list[0].start) if segs_list else 0.0, 2
             )
-            # 한국어 음절 수(가-힣 문자 수) 기반 SPM 계산
             syllable_count = len(re.findall(r'[가-힣]', text))
             spm = round(syllable_count / speech_duration * 60) if speech_duration > 0 else 0
 
-            return text, speech_duration, total_duration, spm
+            # Layer 1: 음고 (Pitch)
+            pitch_mean, pitch_std = _analyze_pitch(tmp_path)
 
-        text, speech_duration, total_duration, spm = \
+            # Layer 2: 침묵·쉬는 구간
+            pause_count, avg_pause_duration = _analyze_pauses(tmp_path)
+
+            # Layer 2: 필러 단어
+            filler_count, filler_rate = _detect_fillers(text, speech_duration)
+
+            # Layer 2: STAR 구조
+            star_score = _detect_star(text)
+
+            # ── Layer 3: 파생 점수 ───────────────────────────────────
+            stress_score = _calc_stress(filler_rate, pause_count, speech_duration, pitch_std)
+            cognitive_load = _calc_cognitive_load(filler_rate, pause_count, speech_duration)
+
+            return (text, speech_duration, total_duration, spm,
+                    pitch_mean, pitch_std,
+                    pause_count, avg_pause_duration,
+                    filler_count, filler_rate,
+                    star_score, stress_score, cognitive_load)
+
+        (text, speech_duration, total_duration, spm,
+         pitch_mean, pitch_std,
+         pause_count, avg_pause_duration,
+         filler_count, filler_rate,
+         star_score, stress_score, cognitive_load) = \
             await loop.run_in_executor(None, run_transcribe)
         if lang_code == "ko":
             text = correct_stt_text(text)
@@ -988,9 +1072,21 @@ async def speech_to_text(
     return {
         "text": text,
         "voice_data": {
+            # Layer 1
             "speechDuration": speech_duration,
             "totalDuration": total_duration,
             "spm": spm,
+            "pitchMean": pitch_mean,
+            "pitchStd": pitch_std,
+            # Layer 2
+            "pauseCount": pause_count,
+            "avgPauseDuration": avg_pause_duration,
+            "fillerCount": filler_count,
+            "fillerRate": filler_rate,
+            "starScore": star_score,
+            # Layer 3
+            "stressScore": stress_score,
+            "cognitiveLoad": cognitive_load,
         },
     }
 
